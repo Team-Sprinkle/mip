@@ -40,9 +40,6 @@ dependencies = [
     "datasets>=4.1.1",
     "einops>=0.8.1",
     "tensordict>=0.5.0",
-    "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4",
-    "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@v1.5.1",
-    "dm-control<=1.0.20",
     "six",
     "termcolor>=3.0.0",
     "ipykernel",
@@ -51,6 +48,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sim = [
+    "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4",
+    "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@v1.5.1",
+    "dm-control<=1.0.20",
+]
 dev = [
     "ruff",
     "pytest>=8.0.0",
