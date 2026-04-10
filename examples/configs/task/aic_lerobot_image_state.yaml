@@ -1,0 +1,57 @@
+# @package task
+defaults:
+  - _self_
+
+env_name: "aic"
+env_type: "lerobot"
+obs_type: "image"
+
+# Local LeRobot dataset directory
+dataset_path: "lerobot_datasets2"
+
+# Train-only workflow for now (no env rollout/eval integration yet)
+enable_env_eval: false
+
+# Required training dimensions
+act_dim: 6
+obs_dim: 128
+obs_steps: 2
+act_steps: 8
+horizon: 10
+num_envs: 1
+
+# Logging/video placeholders (unused while env eval is disabled)
+max_episode_steps: 400
+render_obs_key: "observation.images.center_camera"
+save_video: false
+val_dataset_percentage: 0.0
+
+# Image encoder settings
+resize_shape: null
+crop_shape:
+  - 224
+  - 224
+random_crop: true
+use_group_norm: true
+use_seq: true
+
+shape_meta:
+  action:
+    shape: [6]
+  obs:
+    state:
+      shape: [32]
+      type: low_dim
+      lerobot_key: "observation.state"
+    left_camera:
+      shape: [3, 256, 288]
+      type: rgb
+      lerobot_key: "observation.images.left_camera"
+    center_camera:
+      shape: [3, 256, 288]
+      type: rgb
+      lerobot_key: "observation.images.center_camera"
+    right_camera:
+      shape: [3, 256, 288]
+      type: rgb
+      lerobot_key: "observation.images.right_camera"

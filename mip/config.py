@@ -116,6 +116,7 @@ class TaskConfig:
     shape_meta: dict = field(default_factory=dict)
     render_obs_key: str = "agentview_image"
     val_dataset_percentage: float = 0.0
+    enable_env_eval: bool = False
     # Image observation settings
     rgb_model: str = "resnet18"
     resize_shape: list[int] | None = None

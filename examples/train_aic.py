@@ -1,4 +1,4 @@
-"""Training pipeline for robomimic dataset.
+"""Training pipeline for aic
 
 Author: Chaoyi Pan
 Date: 2025-10-03
@@ -23,8 +23,7 @@ from mip.action_utils import action_rel_to_abs, get_eef_state_from_obs  # noqa: 
 from mip.agent import TrainingAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
-from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
-from mip.envs.robomimic.robomimic_env import make_vec_env  # noqa: E402
+from mip.datasets.lerobot_dataset import make_dataset  # noqa: E402
 from mip.logger import (  # noqa: E402
     Logger,
     compute_average_metrics,
@@ -35,6 +34,19 @@ from mip.scheduler import WarmupAnnealingScheduler  # noqa: E402
 from mip.torch_utils import limit_threads, set_seed  # noqa: E402
 
 torch.set_float32_matmul_precision("high")
+
+
+def resolve_optimization_device(requested_device: str, cuda_available: bool) -> str:
+    """Resolve the effective optimization device based on availability."""
+    if requested_device == "auto":
+        return "cuda" if cuda_available else "cpu"
+    if requested_device == "cpu" and cuda_available:
+        return "cuda"
+    if requested_device.startswith("cuda") and not cuda_available:
+        raise ValueError(
+            "optimization.device is set to CUDA but no CUDA device is available."
+        )
+    return requested_device
 
 
 @contextmanager
@@ -200,7 +212,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
             loguru.logger.info("Save model...")
             logger.save_agent(agent=agent, identifier="latest")
 
-        if ((n_gradient_step + 1) % config.log.eval_freq) == 0:
+        if ((n_gradient_step + 1) % config.log.eval_freq) == 0 and envs is not None:
             loguru.logger.info("Evaluate model...")
             agent.eval()
             metrics = {"step": n_gradient_step}
@@ -267,6 +279,11 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
             logger.log(metrics, category="eval")
             agent.train()
+        elif ((n_gradient_step + 1) % config.log.eval_freq) == 0 and envs is None:
+            loguru.logger.info(
+                "Skipping eval because environment integration is disabled "
+                "(task.enable_env_eval=false)."
+            )
 
 
 def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
@@ -488,6 +505,17 @@ def main(config):
     """Main pipeline function that calls the appropriate standalone function based on mode."""
     os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
+    requested_device = str(config.optimization.device)
+    cuda_available = torch.cuda.is_available()
+    resolved_device = resolve_optimization_device(requested_device, cuda_available)
+    if requested_device == "cpu" and resolved_device == "cuda":
+        loguru.logger.warning(
+            "CUDA is available but optimization.device=cpu. "
+            "Overriding to GPU for flow matching optimization."
+        )
+    config.optimization.device = resolved_device
+    loguru.logger.info(f"Using optimization device: {config.optimization.device}")
+
     if torch.cuda.is_available():
         torch.cuda.set_sync_debug_mode("warn")
         # from torch/rl, compile use tensor cores for float32 matrix multiplication
@@ -508,16 +536,32 @@ def main(config):
             f"ChiUNet requires horizon to be a power of 2, old horizon: {old_horizon}, new horizon: {config.task.horizon}"
         )
 
-    # env setup
-    envs = make_vec_env(config.task, seed=config.optimization.seed)
-    obs, info = envs.reset()
-    if config.task.obs_type == "state":
-        config.task.obs_dim = obs.shape[-1]
+    # env setup (optional for train-only workflow)
+    envs = None
+    if getattr(config.task, "enable_env_eval", False):
+        from mip.envs.robomimic.robomimic_env import make_vec_env
+
+        envs = make_vec_env(config.task, seed=config.optimization.seed)
+        obs, _ = envs.reset()
+        if config.task.obs_type == "state":
+            config.task.obs_dim = obs.shape[-1]
+        else:
+            # For image observations, set obs_dim to embedding dimension
+            # This is used by the network but not actually used when encoder_type is "image"
+            config.task.obs_dim = config.network.emb_dim
+        loguru.logger.info("Finished setting up env")
     else:
-        # For image observations, set obs_dim to embedding dimension
-        # This is used by the network but not actually used when encoder_type is "image"
-        config.task.obs_dim = config.network.emb_dim
-    loguru.logger.info("Finished setting up env")
+        if config.task.obs_type == "image":
+            config.task.obs_dim = config.network.emb_dim
+        elif config.task.obs_type == "state" and config.task.obs_dim <= 0:
+            raise ValueError(
+                "task.obs_dim must be set for state-only training when "
+                "task.enable_env_eval=false"
+            )
+        loguru.logger.info(
+            "Environment setup skipped (task.enable_env_eval=false). "
+            "Training will run without online evaluation."
+        )
 
     # dataset setup
     dataset = make_dataset(config.task)
@@ -549,6 +593,10 @@ def main(config):
     if config.mode == "train":
         train(config, envs, dataset, agent, logger, resume_state=resume_state)
     elif config.mode == "eval":
+        if envs is None:
+            raise ValueError(
+                "Eval mode requires environment integration. Set task.enable_env_eval=true."
+            )
         agent.eval()
 
         num_steps_list = get_default_step_list(config.optimization.loss_type)
