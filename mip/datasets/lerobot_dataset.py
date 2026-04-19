@@ -94,6 +94,7 @@ class LeRobotImageDataset(BaseDataset):
 
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         self._episode_video_paths: list[dict[str, str]] = []
+        self._frame_index_by_step: np.ndarray | None = None
         self._load_episodes()
 
         key_first_k = {}
@@ -113,7 +114,6 @@ class LeRobotImageDataset(BaseDataset):
 
         self.normalizer = self.get_normalizer()
         self._episode_ends = self.replay_buffer.episode_ends.copy()
-        self._episode_starts = np.concatenate(([0], self._episode_ends[:-1]))
         self._episode_index_of_step = self.replay_buffer.get_episode_idxs()
         self._video_capture_cache: dict[str, object] = {}
         self._video_reader_cache: dict[str, imageio.Reader] = {}
@@ -163,22 +163,35 @@ class LeRobotImageDataset(BaseDataset):
 
     def _load_episodes(self):
         data_files = self._split_files(self._list_data_files())
-        logger.info(f"Loading {len(data_files)} LeRobot episodes for mode={self.mode}")
+        logger.info(f"Loading {len(data_files)} LeRobot data files for mode={self.mode}")
+        frame_index_chunks: list[np.ndarray] = []
 
         for data_file in data_files:
             # Only the columns needed for training are loaded.
             lowdim_source_keys = [self.source_obs_key_map[key] for key in self.lowdim_keys]
             frame_df = pd.read_parquet(
                 data_file,
-                columns=["action", *lowdim_source_keys],
+                columns=["action", "episode_index", "frame_index", *lowdim_source_keys],
             )
-            action = np.stack(frame_df["action"].to_numpy()).astype(np.float32)
-            episode = {"action": action}
-            for key in self.lowdim_keys:
-                source_key = self.source_obs_key_map[key]
-                episode[key] = np.stack(frame_df[source_key].to_numpy()).astype(np.float32)
-            self.replay_buffer.add_episode(episode)
-            self._episode_video_paths.append(self._build_episode_video_paths(data_file))
+            video_paths = self._build_episode_video_paths(data_file)
+            episode_ids = frame_df["episode_index"].to_numpy()
+            split_points = np.flatnonzero(np.diff(episode_ids)) + 1
+
+            for episode_df in np.split(frame_df, split_points):
+                action = np.stack(episode_df["action"].to_numpy()).astype(np.float32)
+                episode = {"action": action}
+                for key in self.lowdim_keys:
+                    source_key = self.source_obs_key_map[key]
+                    episode[key] = np.stack(episode_df[source_key].to_numpy()).astype(
+                        np.float32
+                    )
+                self.replay_buffer.add_episode(episode)
+                self._episode_video_paths.append(video_paths)
+                frame_index_chunks.append(
+                    episode_df["frame_index"].to_numpy(dtype=np.int64, copy=True)
+                )
+
+        self._frame_index_by_step = np.concatenate(frame_index_chunks, axis=0)
 
     def get_normalizer(self):
         normalizer = defaultdict(dict)
@@ -278,8 +291,8 @@ class LeRobotImageDataset(BaseDataset):
 
     def _global_to_episode_local(self, global_idx: int) -> tuple[int, int]:
         ep_idx = int(self._episode_index_of_step[global_idx])
-        local_idx = int(global_idx - self._episode_starts[ep_idx])
-        return ep_idx, local_idx
+        frame_idx = int(self._frame_index_by_step[global_idx])
+        return ep_idx, frame_idx
 
     def _build_rgb_obs(self, sample_idx: int) -> dict[str, np.ndarray]:
         T_slice = slice(self.n_obs_steps)

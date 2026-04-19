@@ -117,6 +117,16 @@ class Logger:
             agent.save(fp)
             loguru.logger.info(f"model_{str(identifier)} saved")
 
+    def save_latest_checkpoint(self, agent, checkpoint_name, training_state=None):
+        """Save or update the latest resumable checkpoint in the global folder."""
+        if not agent:
+            return None
+
+        checkpoint_path = self._global_checkpoints_dir / f"{checkpoint_name}_latest.pt"
+        agent.save(checkpoint_path, training_state=training_state)
+        loguru.logger.info(f"Latest checkpoint saved: {checkpoint_path}")
+        return checkpoint_path
+
     def save_global_checkpoint(
         self, agent, checkpoint_name, success_rate, training_state=None
     ):
@@ -191,6 +201,13 @@ class Logger:
         )
 
         if not matching_checkpoints:
+            latest_checkpoint = (
+                self._global_checkpoints_dir / f"{checkpoint_base_name}_latest.pt"
+            )
+            if latest_checkpoint.exists():
+                loguru.logger.info(f"Found latest checkpoint: {latest_checkpoint.name}")
+                return latest_checkpoint
+
             loguru.logger.info(
                 f"No existing checkpoints found for pattern: {checkpoint_base_name}"
             )

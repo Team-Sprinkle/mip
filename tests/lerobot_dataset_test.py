@@ -31,7 +31,7 @@ def _write_episode(
     root: Path,
     *,
     file_idx: int,
-    n_frames: int,
+    n_frames: int | list[int],
     state_dim: int,
     act_dim: int,
     h: int,
@@ -40,11 +40,31 @@ def _write_episode(
     chunk_dir = root / "data" / "chunk-000"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
+    if isinstance(n_frames, int):
+        episode_lengths = [n_frames]
+    else:
+        episode_lengths = list(n_frames)
+
+    actions = []
+    states = []
+    episode_index = []
+    frame_index = []
+    global_step = 0
+    for ep_idx, episode_len in enumerate(episode_lengths):
+        for local_frame_idx in range(episode_len):
+            actions.append(np.full((act_dim,), global_step, dtype=np.float32))
+            states.append(
+                np.linspace(global_step, global_step + 1, state_dim, dtype=np.float32)
+            )
+            episode_index.append(ep_idx)
+            frame_index.append(local_frame_idx)
+            global_step += 1
+
     rows = {
-        "action": [np.full((act_dim,), i, dtype=np.float32) for i in range(n_frames)],
-        "observation.state": [
-            np.linspace(i, i + 1, state_dim, dtype=np.float32) for i in range(n_frames)
-        ],
+        "action": actions,
+        "observation.state": states,
+        "episode_index": episode_index,
+        "frame_index": frame_index,
     }
     df = pd.DataFrame(rows)
     file_stem = f"file-{file_idx:03d}"
@@ -62,11 +82,12 @@ def _write_episode(
             video_dir / f"{file_stem}.mp4", fps=10, macro_block_size=1
         )
         try:
-            for frame_idx in range(n_frames):
-                # Deterministic per-frame value helps padding assertions.
-                val = np.uint8(frame_idx * 10 + cam_idx)
-                frame = np.full((h, w, 3), val, dtype=np.uint8)
-                writer.append_data(frame)
+            for episode_len in episode_lengths:
+                for frame_idx in range(episode_len):
+                    # Deterministic per-frame value helps padding assertions.
+                    val = np.uint8(frame_idx * 10 + cam_idx)
+                    frame = np.full((h, w, 3), val, dtype=np.uint8)
+                    writer.append_data(frame)
         finally:
             writer.close()
 
@@ -193,6 +214,27 @@ def test_lerobot_imageio_fallback_path(fake_lerobot_root: Path):
     frame = dataset._read_frame(dataset._episode_video_paths[0]["left_camera"], 0)
     assert frame.shape == (12, 16, 3)
     assert dataset._disable_cv2_decoder is True
+
+
+def test_lerobot_splits_multi_episode_parquet_and_uses_frame_index(tmp_path: Path):
+    root = tmp_path / "lerobot_multi_episode"
+    _write_episode(
+        root,
+        file_idx=0,
+        n_frames=[3, 4],
+        state_dim=26,
+        act_dim=6,
+        h=12,
+        w=16,
+    )
+    dataset = make_dataset(_make_task_cfg(root))
+
+    assert dataset.replay_buffer.n_episodes == 2
+    assert dataset._frame_index_by_step.tolist() == [0, 1, 2, 0, 1, 2, 3]
+    assert dataset._global_to_episode_local(3) == (1, 0)
+
+    frame = dataset._read_frame(dataset._episode_video_paths[1]["left_camera"], 0)
+    assert frame.shape == (12, 16, 3)
 
 
 def test_lerobot_one_step_agent_update_cpu(fake_lerobot_root: Path):

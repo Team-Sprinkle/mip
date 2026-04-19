@@ -118,6 +118,12 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         for _ in range(start_step):
             lr_scheduler.step()
 
+    checkpoint_base_name = (
+        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
+        f"{config.optimization.loss_type}_{config.network.network_type}_"
+        f"{config.network.emb_dim}_seed{config.optimization.seed}"
+    )
+
     info_list = []
     start_time = time.time()
 
@@ -210,7 +216,17 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
         if ((n_gradient_step + 1) % config.log.save_freq) == 0:
             loguru.logger.info("Save model...")
-            logger.save_agent(agent=agent, identifier="latest")
+            logger.save_agent(agent=agent, identifier=str(n_gradient_step+1))
+            training_state = {
+                "n_gradient_step": n_gradient_step,
+                "best_metrics": best_metrics,
+                "eval_history": eval_history,
+            }
+            # logger.save_latest_checkpoint(
+            #     agent=agent,
+            #     checkpoint_name=checkpoint_base_name,
+            #     training_state=training_state,
+            # )
 
         if ((n_gradient_step + 1) % config.log.eval_freq) == 0 and envs is not None:
             loguru.logger.info("Evaluate model...")
@@ -245,11 +261,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
                     # Save to global checkpoints directory with success rate comparison
                     # Include training state for resuming
-                    checkpoint_base_name = (
-                        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
-                        f"{config.network.emb_dim}_seed{config.optimization.seed}"
-                    )
                     training_state = {
                         "n_gradient_step": n_gradient_step,
                         "best_metrics": best_metrics,
