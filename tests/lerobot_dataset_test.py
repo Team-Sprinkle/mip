@@ -65,6 +65,7 @@ def _write_episode(
         "observation.state": states,
         "episode_index": episode_index,
         "frame_index": frame_index,
+        "index": list(range(global_step)),
     }
     df = pd.DataFrame(rows)
     file_stem = f"file-{file_idx:03d}"
@@ -231,9 +232,11 @@ def test_lerobot_splits_multi_episode_parquet_and_uses_frame_index(tmp_path: Pat
 
     assert dataset.replay_buffer.n_episodes == 2
     assert dataset._frame_index_by_step.tolist() == [0, 1, 2, 0, 1, 2, 3]
+    assert dataset._video_frame_index_by_step.tolist() == [0, 1, 2, 3, 4, 5, 6]
     assert dataset._global_to_episode_local(3) == (1, 0)
+    assert dataset._global_to_episode_video_frame(3) == (1, 3)
 
-    frame = dataset._read_frame(dataset._episode_video_paths[1]["left_camera"], 0)
+    frame = dataset._read_frame(dataset._episode_video_paths[1]["left_camera"], 3)
     assert frame.shape == (12, 16, 3)
 
 

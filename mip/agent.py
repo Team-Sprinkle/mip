@@ -459,6 +459,9 @@ class TrainingAgent:
             loguru.logger.info(
                 f"Loaded training state from step {training_state.get('n_gradient_step', 'unknown')}"
             )
+        else:
+            loguru.logger.info("No training state found in checkpoint")
+            training_state = {"n_gradient_step": 50000}
 
         return training_state
 

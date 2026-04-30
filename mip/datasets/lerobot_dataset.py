@@ -12,6 +12,7 @@ from pathlib import Path
 import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from loguru import logger
 
@@ -95,6 +96,7 @@ class LeRobotImageDataset(BaseDataset):
         self.replay_buffer = ReplayBuffer.create_empty_numpy()
         self._episode_video_paths: list[dict[str, str]] = []
         self._frame_index_by_step: np.ndarray | None = None
+        self._video_frame_index_by_step: np.ndarray | None = None
         self._load_episodes()
 
         key_first_k = {}
@@ -165,19 +167,37 @@ class LeRobotImageDataset(BaseDataset):
         data_files = self._split_files(self._list_data_files())
         logger.info(f"Loading {len(data_files)} LeRobot data files for mode={self.mode}")
         frame_index_chunks: list[np.ndarray] = []
+        video_frame_index_chunks: list[np.ndarray] = []
 
         for data_file in data_files:
             # Only the columns needed for training are loaded.
             lowdim_source_keys = [self.source_obs_key_map[key] for key in self.lowdim_keys]
+            parquet_columns = set(pq.read_schema(data_file).names)
+            has_global_index = "index" in parquet_columns
+            columns = [
+                "action",
+                "episode_index",
+                "frame_index",
+                *lowdim_source_keys,
+            ]
+            if has_global_index:
+                columns.append("index")
             frame_df = pd.read_parquet(
                 data_file,
-                columns=["action", "episode_index", "frame_index", *lowdim_source_keys],
+                columns=columns,
             )
             video_paths = self._build_episode_video_paths(data_file)
             episode_ids = frame_df["episode_index"].to_numpy()
             split_points = np.flatnonzero(np.diff(episode_ids)) + 1
+            file_video_indices = (
+                frame_df["index"].to_numpy(dtype=np.int64, copy=True)
+                if has_global_index
+                else np.arange(len(frame_df), dtype=np.int64)
+            )
 
+            start = 0
             for episode_df in np.split(frame_df, split_points):
+                end = start + len(episode_df)
                 action = np.stack(episode_df["action"].to_numpy()).astype(np.float32)
                 episode = {"action": action}
                 for key in self.lowdim_keys:
@@ -190,8 +210,13 @@ class LeRobotImageDataset(BaseDataset):
                 frame_index_chunks.append(
                     episode_df["frame_index"].to_numpy(dtype=np.int64, copy=True)
                 )
+                video_frame_index_chunks.append(file_video_indices[start:end].copy())
+                start = end
 
         self._frame_index_by_step = np.concatenate(frame_index_chunks, axis=0)
+        self._video_frame_index_by_step = np.concatenate(
+            video_frame_index_chunks, axis=0
+        )
 
     def get_normalizer(self):
         normalizer = defaultdict(dict)
@@ -235,6 +260,11 @@ class LeRobotImageDataset(BaseDataset):
             self._video_reader_cache[video_path] = reader
         return reader
 
+    def _drop_reader(self, video_path: str):
+        reader = self._video_reader_cache.pop(video_path, None)
+        if reader is not None:
+            reader.close()
+
     def _read_frame_cv2(self, video_path: str, frame_idx: int) -> np.ndarray | None:
         cap = self._get_capture(video_path)
         if cap is None:
@@ -265,9 +295,16 @@ class LeRobotImageDataset(BaseDataset):
         try:
             return self._read_frame_imageio(video_path, frame_idx)
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to read frame {frame_idx} from video file: {video_path}"
-            ) from exc
+            self._drop_reader(video_path)
+            try:
+                return self._read_frame_imageio(video_path, frame_idx)
+            except Exception:
+                frame = self._read_frame_cv2(video_path, frame_idx)
+                if frame is not None:
+                    return frame
+                raise RuntimeError(
+                    f"Failed to read frame {frame_idx} from video file: {video_path}"
+                ) from exc
 
     def _frame_ids_for_sequence(self, sample_idx: int) -> np.ndarray:
         (
@@ -294,6 +331,11 @@ class LeRobotImageDataset(BaseDataset):
         frame_idx = int(self._frame_index_by_step[global_idx])
         return ep_idx, frame_idx
 
+    def _global_to_episode_video_frame(self, global_idx: int) -> tuple[int, int]:
+        ep_idx = int(self._episode_index_of_step[global_idx])
+        frame_idx = int(self._video_frame_index_by_step[global_idx])
+        return ep_idx, frame_idx
+
     def _build_rgb_obs(self, sample_idx: int) -> dict[str, np.ndarray]:
         T_slice = slice(self.n_obs_steps)
         frame_ids = self._frame_ids_for_sequence(sample_idx)[T_slice]
@@ -303,8 +345,11 @@ class LeRobotImageDataset(BaseDataset):
             c, h_expected, w_expected = self.shape_meta["obs"][key]["shape"]
             frames = []
             for global_idx in frame_ids:
-                ep_idx, local_idx = self._global_to_episode_local(int(global_idx))
-                frame = self._read_frame(self._episode_video_paths[ep_idx][key], local_idx)
+                ep_idx, video_idx = self._global_to_episode_video_frame(int(global_idx))
+                frame = self._read_frame(
+                    self._episode_video_paths[ep_idx][key],
+                    video_idx,
+                )
                 if frame.shape[0] != h_expected or frame.shape[1] != w_expected:
                     frame = cv2.resize(
                         frame,

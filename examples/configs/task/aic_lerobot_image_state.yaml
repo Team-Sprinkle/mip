@@ -7,7 +7,7 @@ env_type: "lerobot"
 obs_type: "image"
 
 # Local LeRobot dataset directory
-dataset_path: "/home/jk/ws_aic/src/aic/outputs/fixed_20_trials_sfp2nic_filtered_dataset/"
+dataset_path: "/home/jk/ws_aic/src/aic/outputs/fixed_20_trials_sfp2nic_filtered_dataset_actions/"
 
 # Train-only workflow for now (no env rollout/eval integration yet)
 enable_env_eval: false
