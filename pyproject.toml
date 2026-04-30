@@ -27,6 +27,7 @@ dependencies = [
     "gymnasium",
     "torch",
     "torchvision",
+    "transformers",
     "numba",
     "scikit-image",
     "pygame",

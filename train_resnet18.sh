@@ -1,0 +1,20 @@
+uv run python examples/train_aic.py\
+ task=aic_lerobot_image_state\
+ network=chitransformer\
+ network.rgb_model_name=resnet18\
+ network.emb_dim=384\
+ network.num_layers=8\
+ network.n_cond_layers=0\
+ task.obs_steps=2\
+ task.horizon=10\
+ task.act_steps=8\
+ optimization.gradient_steps=100000\
+ optimization.batch_size=4\
+ optimization.device=cuda\
+ optimization.auto_resume=false\
+ log.log_freq=10\
+ log.save_freq=5000\
+ log.eval_freq=1000\
+ log.wandb_mode=online \
+ log.project=aic \
+ log.group=chitransformer+resnet18

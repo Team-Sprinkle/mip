@@ -5,6 +5,7 @@ Date: 2025-10-03
 """
 
 import os
+import re
 import time
 from contextlib import contextmanager
 
@@ -34,6 +35,19 @@ from mip.scheduler import WarmupAnnealingScheduler  # noqa: E402
 from mip.torch_utils import limit_threads, set_seed  # noqa: E402
 
 torch.set_float32_matmul_precision("high")
+
+
+def _sanitize_identifier_part(value: str) -> str:
+    """Convert a config-provided name to a filesystem-friendly identifier part."""
+    sanitized = re.sub(r"[^A-Za-z0-9._+=-]+", "_", str(value).strip())
+    return sanitized.strip("_") or "default"
+
+
+def build_run_identifier(config: Config) -> str:
+    """Build the base identifier used for AIC checkpoints and model files."""
+    group = _sanitize_identifier_part(config.log.group)
+    exp_name = _sanitize_identifier_part(config.log.exp_name)
+    return f"{group}_{exp_name}"
 
 
 def resolve_optimization_device(requested_device: str, cuda_available: bool) -> str:
@@ -118,11 +132,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         for _ in range(start_step):
             lr_scheduler.step()
 
-    checkpoint_base_name = (
-        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-        f"{config.optimization.loss_type}_{config.network.network_type}_"
-        f"{config.network.emb_dim}_seed{config.optimization.seed}"
-    )
+    checkpoint_base_name = build_run_identifier(config)
 
     info_list = []
     start_time = time.time()
@@ -216,7 +226,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
         if ((n_gradient_step + 1) % config.log.save_freq) == 0:
             loguru.logger.info("Save model...")
-            logger.save_agent(agent=agent, identifier=str(n_gradient_step+1))
+            logger.save_agent(
+                agent=agent,
+                identifier=f"{checkpoint_base_name}_step{n_gradient_step + 1}",
+            )
             training_state = {
                 "n_gradient_step": n_gradient_step,
                 "best_metrics": best_metrics,
@@ -257,7 +270,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                         f"New best model! {primary_metric_key} = {success_rate:.4f}"
                     )
                     # Save to local models directory
-                    logger.save_agent(agent=agent, identifier="best")
+                    logger.save_agent(
+                        agent=agent, identifier=f"{checkpoint_base_name}_best"
+                    )
 
                     # Save to global checkpoints directory with success rate comparison
                     # Include training state for resuming
@@ -586,11 +601,7 @@ def main(config):
         resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
     elif config.optimization.auto_resume:
         # Automatically look for checkpoint to resume from
-        checkpoint_base_name = (
-            f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
-            f"{config.network.emb_dim}_seed{config.optimization.seed}"
-        )
+        checkpoint_base_name = build_run_identifier(config)
         checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
         if checkpoint_path:
             loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")

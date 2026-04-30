@@ -616,6 +616,124 @@ def get_resnet(name, weights=None, **kwargs):
     return resnet
 
 
+class FrozenSiglip2VisionEncoder(nn.Module):
+    """Frozen fixed-resolution SigLIP2 vision backbone."""
+
+    default_model_name = "google/siglip2-base-patch16-224"
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        model: nn.Module | None = None,
+        image_mean: list[float] | None = None,
+        image_std: list[float] | None = None,
+    ):
+        super().__init__()
+        self.model_name = model_name or self.default_model_name
+        if model is None:
+            from transformers import AutoImageProcessor, AutoModel
+
+            model = AutoModel.from_pretrained(self.model_name)
+            try:
+                image_processor = AutoImageProcessor.from_pretrained(self.model_name)
+                image_mean = image_processor.image_mean
+                image_std = image_processor.image_std
+            except OSError:
+                image_mean = [0.5, 0.5, 0.5]
+                image_std = [0.5, 0.5, 0.5]
+
+        self.model = model
+        self.model.requires_grad_(False)
+        self.model.eval()
+        self.image_mean = image_mean or [0.5, 0.5, 0.5]
+        self.image_std = image_std or [0.5, 0.5, 0.5]
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.model.eval()
+        return self
+
+    def forward(self, pixel_values):
+        with torch.no_grad():
+            if hasattr(self.model, "get_image_features"):
+                if self.model.config.model_type == "siglip2":
+                    pixel_values, pixel_attention_mask, spatial_shapes = self.patchify(
+                        pixel_values
+                    )
+                    outputs = self.model.get_image_features(
+                        pixel_values=pixel_values,
+                        pixel_attention_mask=pixel_attention_mask,
+                        spatial_shapes=spatial_shapes,
+                    )
+                else:
+                    outputs = self.model.get_image_features(pixel_values=pixel_values)
+            else:
+                pixel_values, pixel_attention_mask, spatial_shapes = self.patchify(
+                    pixel_values
+                )
+                outputs = self.model(
+                    pixel_values=pixel_values,
+                    pixel_attention_mask=pixel_attention_mask,
+                    spatial_shapes=spatial_shapes,
+                )
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        if outputs.pooler_output is not None:
+            return outputs.pooler_output
+        return outputs.last_hidden_state[:, 0]
+
+    def patchify(self, pixel_values):
+        if pixel_values.ndim != 4:
+            raise ValueError("SigLIP2 expects image tensors shaped (B, C, H, W)")
+
+        batch_size, channels, height, width = pixel_values.shape
+        patch_size = self.model.config.patch_size
+        if height % patch_size != 0 or width % patch_size != 0:
+            raise ValueError(
+                "SigLIP2 image height and width must be divisible by "
+                f"patch_size={patch_size}; got {(height, width)}"
+            )
+
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        patches = pixel_values.unfold(2, patch_size, patch_size).unfold(
+            3, patch_size, patch_size
+        )
+        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(
+            batch_size,
+            grid_h * grid_w,
+            channels * patch_size * patch_size,
+        )
+        pixel_attention_mask = torch.ones(
+            batch_size,
+            grid_h * grid_w,
+            dtype=torch.bool,
+            device=pixel_values.device,
+        )
+        spatial_shapes = torch.tensor(
+            [[grid_h, grid_w]],
+            dtype=torch.long,
+            device=pixel_values.device,
+        ).expand(batch_size, -1)
+        return patches, pixel_attention_mask, spatial_shapes
+
+
+def get_siglip2(model_name: str) -> FrozenSiglip2VisionEncoder:
+    if model_name == "siglip2":
+        model_name = FrozenSiglip2VisionEncoder.default_model_name
+    elif model_name.startswith("siglip2:"):
+        model_name = model_name.removeprefix("siglip2:")
+    return FrozenSiglip2VisionEncoder(model_name=model_name)
+
+
+def get_rgb_model(name: str) -> nn.Module:
+    if "resnet" in name:
+        return get_resnet(name)
+    if name == "siglip2" or name.startswith("siglip2:"):
+        return get_siglip2(name)
+    raise ValueError(f"Unsupported rgb_model_name: {name}")
+
+
 class MultiImageObsEncoder(BaseEncoder):
     """Input:
         - condition: {"cond1": (b, *cond1_shape), "cond2": (b, *cond2_shape), ...} or (b, *cond_in_shape)
@@ -655,11 +773,10 @@ class MultiImageObsEncoder(BaseEncoder):
         key_transform_map = nn.ModuleDict()
         key_shape_map = {}
 
-        # rgb_model
-        if "resnet" in rgb_model_name:
-            rgb_model = get_resnet(rgb_model_name)
-        else:
-            raise ValueError("Fatal rgb_model")
+        rgb_model = get_rgb_model(rgb_model_name)
+        is_siglip2 = isinstance(rgb_model, FrozenSiglip2VisionEncoder)
+        if is_siglip2:
+            share_rgb_model = True
 
         # handle sharing vision backbone
         if share_rgb_model:
@@ -686,7 +803,7 @@ class MultiImageObsEncoder(BaseEncoder):
                         this_model = copy.deepcopy(rgb_model)
 
                 if this_model is not None:
-                    if use_group_norm:
+                    if use_group_norm and not is_siglip2:
                         this_model = replace_submodules(
                             root_module=this_model,
                             predicate=lambda x: isinstance(x, nn.BatchNorm2d),
@@ -727,7 +844,11 @@ class MultiImageObsEncoder(BaseEncoder):
                         this_randomizer = torchvision.transforms.CenterCrop(size=(h, w))
                 # configure normalizer
                 this_normalizer = nn.Identity()
-                if imagenet_norm:
+                if is_siglip2:
+                    this_normalizer = torchvision.transforms.Normalize(
+                        mean=rgb_model.image_mean, std=rgb_model.image_std
+                    )
+                elif imagenet_norm:
                     this_normalizer = torchvision.transforms.Normalize(
                         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
                     )

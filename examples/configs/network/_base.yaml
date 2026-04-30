@@ -9,7 +9,8 @@ encoder_dropout: 0.0   # Dropout for encoder
 encoder_type: "mlp"    # "mlp", "per_step_mlp", "identity"
 emb_dim: -1
 
-# Image encoder configs (used when obs_type is "image")
+# Image encoder configs (used when obs_type is "image").
+# Use "siglip2" or "siglip2:<hf-model-id>" for a frozen shared SigLIP2 backbone.
 rgb_model_name: "resnet18"
 use_seq: true
 keep_horizon_dims: true
