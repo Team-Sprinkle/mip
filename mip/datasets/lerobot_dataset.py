@@ -5,6 +5,7 @@ Date: 2026-04-02
 
 from __future__ import annotations
 
+import json
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +13,6 @@ from pathlib import Path
 import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import torch
 from loguru import logger
 
@@ -97,6 +97,8 @@ class LeRobotImageDataset(BaseDataset):
         self._episode_video_paths: list[dict[str, str]] = []
         self._frame_index_by_step: np.ndarray | None = None
         self._video_frame_index_by_step: np.ndarray | None = None
+        self._video_frame_index_by_step_by_key: dict[str, np.ndarray] = {}
+        self._video_episode_metadata = self._load_video_episode_metadata()
         self._load_episodes()
 
         key_first_k = {}
@@ -147,14 +149,83 @@ class LeRobotImageDataset(BaseDataset):
             return all_files[train_count:]
         raise ValueError(f"Invalid mode: {self.mode}. Must be 'train' or 'val'.")
 
-    def _build_episode_video_paths(self, data_file: Path) -> dict[str, str]:
+    def _load_video_episode_metadata(
+        self,
+    ) -> dict[int, dict[str, dict[str, int | str]]]:
+        metadata_files = sorted(
+            (self.dataset_dir / "meta" / "episodes").glob("chunk-*/file-*.parquet")
+        )
+        if not metadata_files:
+            return {}
+
+        fps = 30.0
+        info_path = self.dataset_dir / "meta" / "info.json"
+        if info_path.exists():
+            with info_path.open() as f:
+                fps = float(json.load(f).get("fps", fps))
+
+        episode_metadata: dict[int, dict[str, dict[str, int | str]]] = {}
+        for metadata_file in metadata_files:
+            episode_df = pd.read_parquet(metadata_file)
+            for row in episode_df.to_dict("records"):
+                episode_index = int(row["episode_index"])
+                key_metadata = {}
+                for key in self.rgb_keys:
+                    source_key = self.source_obs_key_map[key]
+                    prefix = f"videos/{source_key}"
+                    chunk_col = f"{prefix}/chunk_index"
+                    file_col = f"{prefix}/file_index"
+                    timestamp_col = f"{prefix}/from_timestamp"
+                    if chunk_col not in row or file_col not in row:
+                        continue
+                    video_path = (
+                        self.dataset_dir
+                        / "videos"
+                        / source_key
+                        / f"chunk-{int(row[chunk_col]):03d}"
+                        / f"file-{int(row[file_col]):03d}.mp4"
+                    )
+                    key_metadata[key] = {
+                        "path": str(video_path),
+                        "start_frame": int(
+                            round(float(row.get(timestamp_col, 0.0)) * fps)
+                        ),
+                    }
+                if key_metadata:
+                    episode_metadata[episode_index] = key_metadata
+
+        return episode_metadata
+
+    def _build_episode_video_paths(
+        self,
+        data_file: Path,
+        episode_index: int | None = None,
+    ) -> dict[str, str]:
+        if episode_index in self._video_episode_metadata:
+            mapping = {}
+            for key in self.rgb_keys:
+                if key not in self._video_episode_metadata[episode_index]:
+                    break
+                video_path = self._video_episode_metadata[episode_index][key]["path"]
+                if not Path(video_path).exists():
+                    raise FileNotFoundError(
+                        f"Missing video file for {key}: {video_path}"
+                    )
+                mapping[key] = str(video_path)
+            if len(mapping) == len(self.rgb_keys):
+                return mapping
+
         chunk_dir = data_file.parent.name  # chunk-000
         file_stem = data_file.stem  # file-000
         mapping = {}
         for key in self.rgb_keys:
             source_key = self.source_obs_key_map[key]
             video_path = (
-                self.dataset_dir / "videos" / source_key / chunk_dir / f"{file_stem}.mp4"
+                self.dataset_dir
+                / "videos"
+                / source_key
+                / chunk_dir
+                / f"{file_stem}.mp4"
             )
             if not video_path.exists():
                 raise FileNotFoundError(
@@ -163,41 +234,51 @@ class LeRobotImageDataset(BaseDataset):
             mapping[key] = str(video_path)
         return mapping
 
+    def _video_start_frame_for_episode(
+        self,
+        episode_index: int,
+        key: str,
+    ) -> int | None:
+        if episode_index not in self._video_episode_metadata:
+            return None
+        key_metadata = self._video_episode_metadata[episode_index].get(key)
+        if key_metadata is None:
+            return None
+        return int(key_metadata["start_frame"])
+
     def _load_episodes(self):
         data_files = self._split_files(self._list_data_files())
-        logger.info(f"Loading {len(data_files)} LeRobot data files for mode={self.mode}")
+        logger.info(
+            f"Loading {len(data_files)} LeRobot data files for mode={self.mode}"
+        )
         frame_index_chunks: list[np.ndarray] = []
-        video_frame_index_chunks: list[np.ndarray] = []
+        video_frame_index_chunks_by_key: dict[str, list[np.ndarray]] = {
+            key: [] for key in self.rgb_keys
+        }
 
         for data_file in data_files:
             # Only the columns needed for training are loaded.
-            lowdim_source_keys = [self.source_obs_key_map[key] for key in self.lowdim_keys]
-            parquet_columns = set(pq.read_schema(data_file).names)
-            has_global_index = "index" in parquet_columns
+            lowdim_source_keys = [
+                self.source_obs_key_map[key] for key in self.lowdim_keys
+            ]
             columns = [
                 "action",
                 "episode_index",
                 "frame_index",
                 *lowdim_source_keys,
             ]
-            if has_global_index:
-                columns.append("index")
             frame_df = pd.read_parquet(
                 data_file,
                 columns=columns,
             )
-            video_paths = self._build_episode_video_paths(data_file)
             episode_ids = frame_df["episode_index"].to_numpy()
             split_points = np.flatnonzero(np.diff(episode_ids)) + 1
-            file_video_indices = (
-                frame_df["index"].to_numpy(dtype=np.int64, copy=True)
-                if has_global_index
-                else np.arange(len(frame_df), dtype=np.int64)
-            )
+            file_video_indices = np.arange(len(frame_df), dtype=np.int64)
 
             start = 0
             for episode_df in np.split(frame_df, split_points):
                 end = start + len(episode_df)
+                episode_index = int(episode_df["episode_index"].iloc[0])
                 action = np.stack(episode_df["action"].to_numpy()).astype(np.float32)
                 episode = {"action": action}
                 for key in self.lowdim_keys:
@@ -206,17 +287,39 @@ class LeRobotImageDataset(BaseDataset):
                         np.float32
                     )
                 self.replay_buffer.add_episode(episode)
-                self._episode_video_paths.append(video_paths)
+                self._episode_video_paths.append(
+                    self._build_episode_video_paths(data_file, episode_index)
+                )
                 frame_index_chunks.append(
                     episode_df["frame_index"].to_numpy(dtype=np.int64, copy=True)
                 )
-                video_frame_index_chunks.append(file_video_indices[start:end].copy())
+                for key in self.rgb_keys:
+                    video_start_frame = self._video_start_frame_for_episode(
+                        episode_index,
+                        key,
+                    )
+                    if video_start_frame is None:
+                        video_frame_index_chunks_by_key[key].append(
+                            file_video_indices[start:end].copy()
+                        )
+                    else:
+                        video_frame_index_chunks_by_key[key].append(
+                            episode_df["frame_index"].to_numpy(
+                                dtype=np.int64,
+                                copy=True,
+                            )
+                            + video_start_frame
+                        )
                 start = end
 
         self._frame_index_by_step = np.concatenate(frame_index_chunks, axis=0)
-        self._video_frame_index_by_step = np.concatenate(
-            video_frame_index_chunks, axis=0
-        )
+        self._video_frame_index_by_step_by_key = {
+            key: np.concatenate(chunks, axis=0)
+            for key, chunks in video_frame_index_chunks_by_key.items()
+        }
+        self._video_frame_index_by_step = self._video_frame_index_by_step_by_key[
+            self.rgb_keys[0]
+        ]
 
     def get_normalizer(self):
         normalizer = defaultdict(dict)
@@ -256,7 +359,10 @@ class LeRobotImageDataset(BaseDataset):
     def _get_reader(self, video_path: str):
         reader = self._video_reader_cache.get(video_path)
         if reader is None:
-            reader = imageio.get_reader(video_path)
+            reader = imageio.get_reader(
+                video_path,
+                input_params=["-hwaccel", "none"],
+            )
             self._video_reader_cache[video_path] = reader
         return reader
 
@@ -299,9 +405,10 @@ class LeRobotImageDataset(BaseDataset):
             try:
                 return self._read_frame_imageio(video_path, frame_idx)
             except Exception:
-                frame = self._read_frame_cv2(video_path, frame_idx)
-                if frame is not None:
-                    return frame
+                if not self._disable_cv2_decoder:
+                    frame = self._read_frame_cv2(video_path, frame_idx)
+                    if frame is not None:
+                        return frame
                 raise RuntimeError(
                     f"Failed to read frame {frame_idx} from video file: {video_path}"
                 ) from exc
@@ -332,8 +439,17 @@ class LeRobotImageDataset(BaseDataset):
         return ep_idx, frame_idx
 
     def _global_to_episode_video_frame(self, global_idx: int) -> tuple[int, int]:
+        if not self.rgb_keys:
+            raise ValueError("No RGB keys configured for video frame lookup")
+        return self._global_to_episode_video_frame_for_key(global_idx, self.rgb_keys[0])
+
+    def _global_to_episode_video_frame_for_key(
+        self,
+        global_idx: int,
+        key: str,
+    ) -> tuple[int, int]:
         ep_idx = int(self._episode_index_of_step[global_idx])
-        frame_idx = int(self._video_frame_index_by_step[global_idx])
+        frame_idx = int(self._video_frame_index_by_step_by_key[key][global_idx])
         return ep_idx, frame_idx
 
     def _build_rgb_obs(self, sample_idx: int) -> dict[str, np.ndarray]:
@@ -345,7 +461,10 @@ class LeRobotImageDataset(BaseDataset):
             c, h_expected, w_expected = self.shape_meta["obs"][key]["shape"]
             frames = []
             for global_idx in frame_ids:
-                ep_idx, video_idx = self._global_to_episode_video_frame(int(global_idx))
+                ep_idx, video_idx = self._global_to_episode_video_frame_for_key(
+                    int(global_idx),
+                    key,
+                )
                 frame = self._read_frame(
                     self._episode_video_paths[ep_idx][key],
                     video_idx,

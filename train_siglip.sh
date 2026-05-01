@@ -18,4 +18,4 @@ uv run python examples/train_aic.py\
  log.eval_freq=1000\
  log.wandb_mode=online \
  log.project=aic \
- log.group=chitransformer+siglip2
+ log.group=chitransformer+siglip2_sfp2nic_card2_port1_randomized

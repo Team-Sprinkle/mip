@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,14 +37,12 @@ def _write_episode(
     act_dim: int,
     h: int,
     w: int,
+    index_offset: int = 0,
 ) -> None:
     chunk_dir = root / "data" / "chunk-000"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    if isinstance(n_frames, int):
-        episode_lengths = [n_frames]
-    else:
-        episode_lengths = list(n_frames)
+    episode_lengths = [n_frames] if isinstance(n_frames, int) else list(n_frames)
 
     actions = []
     states = []
@@ -65,7 +64,7 @@ def _write_episode(
         "observation.state": states,
         "episode_index": episode_index,
         "frame_index": frame_index,
-        "index": list(range(global_step)),
+        "index": list(range(index_offset, index_offset + global_step)),
     }
     df = pd.DataFrame(rows)
     file_stem = f"file-{file_idx:03d}"
@@ -238,6 +237,81 @@ def test_lerobot_splits_multi_episode_parquet_and_uses_frame_index(tmp_path: Pat
 
     frame = dataset._read_frame(dataset._episode_video_paths[1]["left_camera"], 3)
     assert frame.shape == (12, 16, 3)
+
+
+def test_lerobot_video_indices_are_file_local_when_global_index_is_offset(
+    tmp_path: Path,
+):
+    root = tmp_path / "lerobot_global_index"
+    _write_episode(
+        root,
+        file_idx=0,
+        n_frames=4,
+        state_dim=26,
+        act_dim=6,
+        h=12,
+        w=16,
+        index_offset=207792,
+    )
+    dataset = make_dataset(_make_task_cfg(root))
+
+    assert dataset._video_frame_index_by_step.tolist() == [0, 1, 2, 3]
+    frame = dataset._read_frame(dataset._episode_video_paths[0]["left_camera"], 3)
+    assert frame.shape == (12, 16, 3)
+
+
+def test_lerobot_uses_per_camera_video_metadata_offsets(tmp_path: Path):
+    root = tmp_path / "lerobot_video_metadata"
+    _write_episode(
+        root, file_idx=0, n_frames=[3, 3], state_dim=26, act_dim=6, h=12, w=16
+    )
+
+    info_dir = root / "meta"
+    episodes_dir = info_dir / "episodes" / "chunk-000"
+    episodes_dir.mkdir(parents=True)
+    (info_dir / "info.json").write_text(json.dumps({"fps": 10}))
+
+    pd.DataFrame(
+        {
+            "episode_index": [0, 1],
+            "videos/observation.images.left_camera/chunk_index": [0, 0],
+            "videos/observation.images.left_camera/file_index": [0, 0],
+            "videos/observation.images.left_camera/from_timestamp": [0.0, 0.3],
+            "videos/observation.images.center_camera/chunk_index": [0, 0],
+            "videos/observation.images.center_camera/file_index": [0, 0],
+            "videos/observation.images.center_camera/from_timestamp": [0.0, 0.1],
+            "videos/observation.images.right_camera/chunk_index": [0, 0],
+            "videos/observation.images.right_camera/file_index": [0, 0],
+            "videos/observation.images.right_camera/from_timestamp": [0.0, 0.2],
+        }
+    ).to_parquet(episodes_dir / "file-000.parquet", index=False)
+
+    dataset = make_dataset(_make_task_cfg(root))
+
+    assert dataset._video_frame_index_by_step_by_key["left_camera"].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert dataset._video_frame_index_by_step_by_key["center_camera"].tolist() == [
+        0,
+        1,
+        2,
+        1,
+        2,
+        3,
+    ]
+    assert dataset._video_frame_index_by_step_by_key["right_camera"].tolist() == [
+        0,
+        1,
+        2,
+        2,
+        3,
+        4,
+    ]
 
 
 def test_lerobot_one_step_agent_update_cpu(fake_lerobot_root: Path):
