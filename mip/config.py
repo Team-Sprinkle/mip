@@ -63,6 +63,11 @@ class NetworkConfig:
     rgb_model_name: str = "resnet18"
     use_seq: bool = True
     keep_horizon_dims: bool = True
+    low_dim_encoder_dim: int = 0
+    low_dim_encoder_hidden_dim: int = 128
+    low_dim_encoder_layers: int = 2
+    low_dim_encoder_activation: str = "gelu"
+    low_dim_encoder_layer_norm: bool = True
     # Transformer specific configs
     n_heads: int = 6
     n_cond_layers: int = 0

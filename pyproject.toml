@@ -43,6 +43,7 @@ dependencies = [
     "tensordict>=0.5.0",
     "six",
     "termcolor>=3.0.0",
+    "tensorboard>=2.20.0",
     "ipykernel",
     # "gym>=0.13,<0.24",
     #"mujoco==3.1.6",

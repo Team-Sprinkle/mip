@@ -19,6 +19,11 @@ from omegaconf import OmegaConf
 from mip.config import Config
 from mip.env_utils import VideoRecordingWrapper
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - optional dependency at runtime
+    SummaryWriter = None
+
 
 def make_dir(dir_path):
     """Create directory if it does not already exist."""
@@ -52,6 +57,15 @@ class Logger:
             dir=self._log_dir,
         )
         self._wandb = wandb
+        self._tb_writer = None
+        if SummaryWriter is not None:
+            tb_dir = self._log_dir / "tensorboard"
+            self._tb_writer = SummaryWriter(log_dir=str(tb_dir))
+            self._tb_writer.add_text(
+                "config/json",
+                json.dumps(OmegaConf.to_container(omega_config), indent=2),
+                global_step=0,
+            )
 
     def video_init(self, env, enable=False, video_id=""):
         """Initialize video recording for an environment.
@@ -110,6 +124,19 @@ class Logger:
 
         # Log to wandb
         self._wandb.log(_d, step=d["step"])
+
+        if self._tb_writer is not None:
+            step = int(d["step"])
+            for key, value in json_safe_dict.items():
+                if key == "step":
+                    continue
+                if isinstance(value, torch.Tensor):
+                    if value.numel() != 1:
+                        continue
+                    value = value.item()
+                if isinstance(value, (int, float)):
+                    self._tb_writer.add_scalar(f"{category}/{key}", value, step)
+            self._tb_writer.flush()
 
     def save_agent(self, agent=None, identifier="final"):
         if agent:
@@ -246,6 +273,8 @@ class Logger:
             loguru.logger.error(f"Failed to save model: {e}")
         if self._wandb:
             self._wandb.finish()
+        if self._tb_writer is not None:
+            self._tb_writer.close()
 
 
 def update_best_metrics(best_metrics, current_metrics):

@@ -18,6 +18,19 @@ import mip.torch_utils as tu
 from mip.torch_utils import at_least_ndim
 
 
+def _make_activation(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "leaky_relu":
+        return nn.LeakyReLU()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "silu":
+        return nn.SiLU()
+    raise ValueError(f"Unsupported activation: {name}")
+
+
 def get_mask(
     mask: torch.Tensor,
     mask_shape: tuple,
@@ -718,6 +731,63 @@ class FrozenSiglip2VisionEncoder(nn.Module):
         return patches, pixel_attention_mask, spatial_shapes
 
 
+class FrozenDinoV2VisionEncoder(nn.Module):
+    """Frozen DINOv2 vision backbone with a pooled image feature output."""
+
+    default_model_name = "facebook/dinov2-base"
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        model: nn.Module | None = None,
+        image_mean: list[float] | None = None,
+        image_std: list[float] | None = None,
+    ):
+        super().__init__()
+        self.model_name = model_name or self.default_model_name
+        if model is None:
+            from transformers import AutoImageProcessor, AutoModel
+
+            model = AutoModel.from_pretrained(self.model_name)
+            try:
+                image_processor = AutoImageProcessor.from_pretrained(self.model_name)
+                image_mean = image_processor.image_mean
+                image_std = image_processor.image_std
+            except OSError:
+                image_mean = [0.485, 0.456, 0.406]
+                image_std = [0.229, 0.224, 0.225]
+
+        self.model = model
+        self.model.requires_grad_(False)
+        self.model.eval()
+        self.image_mean = image_mean or [0.485, 0.456, 0.406]
+        self.image_std = image_std or [0.229, 0.224, 0.225]
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.model.eval()
+        return self
+
+    def forward(self, pixel_values):
+        if pixel_values.ndim != 4:
+            raise ValueError("DINOv2 expects image tensors shaped (B, C, H, W)")
+
+        with torch.no_grad():
+            try:
+                outputs = self.model(
+                    pixel_values=pixel_values,
+                    interpolate_pos_encoding=True,
+                )
+            except TypeError:
+                outputs = self.model(pixel_values=pixel_values)
+
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        if getattr(outputs, "pooler_output", None) is not None:
+            return outputs.pooler_output
+        return outputs.last_hidden_state[:, 0]
+
+
 def get_siglip2(model_name: str) -> FrozenSiglip2VisionEncoder:
     if model_name == "siglip2":
         model_name = FrozenSiglip2VisionEncoder.default_model_name
@@ -726,11 +796,21 @@ def get_siglip2(model_name: str) -> FrozenSiglip2VisionEncoder:
     return FrozenSiglip2VisionEncoder(model_name=model_name)
 
 
+def get_dinov2(model_name: str) -> FrozenDinoV2VisionEncoder:
+    if model_name == "dinov2":
+        model_name = FrozenDinoV2VisionEncoder.default_model_name
+    elif model_name.startswith("dinov2:"):
+        model_name = model_name.removeprefix("dinov2:")
+    return FrozenDinoV2VisionEncoder(model_name=model_name)
+
+
 def get_rgb_model(name: str) -> nn.Module:
     if "resnet" in name:
         return get_resnet(name)
     if name == "siglip2" or name.startswith("siglip2:"):
         return get_siglip2(name)
+    if name == "dinov2" or name.startswith("dinov2:"):
+        return get_dinov2(name)
     raise ValueError(f"Unsupported rgb_model_name: {name}")
 
 
@@ -765,17 +845,26 @@ class MultiImageObsEncoder(BaseEncoder):
         use_seq=False,
         # if True: (bs, seq_len, embed_dim)
         keep_horizon_dims=False,
+        # optional per-lowdim-key projection before image/state concat
+        low_dim_encoder_dim: int = 0,
+        low_dim_encoder_hidden_dim: int = 128,
+        low_dim_encoder_layers: int = 2,
+        low_dim_encoder_activation: str = "gelu",
+        low_dim_encoder_layer_norm: bool = True,
     ):
         super().__init__()
         rgb_keys = []
         low_dim_keys = []
         key_model_map = nn.ModuleDict()
         key_transform_map = nn.ModuleDict()
+        low_dim_encoder_map = nn.ModuleDict()
         key_shape_map = {}
 
         rgb_model = get_rgb_model(rgb_model_name)
-        is_siglip2 = isinstance(rgb_model, FrozenSiglip2VisionEncoder)
-        if is_siglip2:
+        is_frozen_hf_vision = isinstance(
+            rgb_model, (FrozenSiglip2VisionEncoder, FrozenDinoV2VisionEncoder)
+        )
+        if is_frozen_hf_vision:
             share_rgb_model = True
 
         # handle sharing vision backbone
@@ -803,7 +892,7 @@ class MultiImageObsEncoder(BaseEncoder):
                         this_model = copy.deepcopy(rgb_model)
 
                 if this_model is not None:
-                    if use_group_norm and not is_siglip2:
+                    if use_group_norm and not is_frozen_hf_vision:
                         this_model = replace_submodules(
                             root_module=this_model,
                             predicate=lambda x: isinstance(x, nn.BatchNorm2d),
@@ -844,7 +933,7 @@ class MultiImageObsEncoder(BaseEncoder):
                         this_randomizer = torchvision.transforms.CenterCrop(size=(h, w))
                 # configure normalizer
                 this_normalizer = nn.Identity()
-                if is_siglip2:
+                if is_frozen_hf_vision:
                     this_normalizer = torchvision.transforms.Normalize(
                         mean=rgb_model.image_mean, std=rgb_model.image_std
                     )
@@ -859,6 +948,19 @@ class MultiImageObsEncoder(BaseEncoder):
                 key_transform_map[key] = this_transform
             elif type == "low_dim":
                 low_dim_keys.append(key)
+                if low_dim_encoder_dim > 0:
+                    input_dim = int(torch.tensor(shape).prod().item())
+                    layers = []
+                    in_dim = input_dim
+                    for _ in range(low_dim_encoder_layers):
+                        layers.append(nn.Linear(in_dim, low_dim_encoder_hidden_dim))
+                        layers.append(_make_activation(low_dim_encoder_activation))
+                        if low_dim_encoder_layer_norm:
+                            layers.append(nn.LayerNorm(low_dim_encoder_hidden_dim))
+                        in_dim = low_dim_encoder_hidden_dim
+                    layers.append(nn.Linear(in_dim, low_dim_encoder_dim))
+                    layers.append(_make_activation(low_dim_encoder_activation))
+                    low_dim_encoder_map[key] = nn.Sequential(*layers)
             else:
                 raise RuntimeError(f"Unsupported obs type: {type}")
         rgb_keys = sorted(rgb_keys)
@@ -867,6 +969,7 @@ class MultiImageObsEncoder(BaseEncoder):
         self.shape_meta = shape_meta
         self.key_model_map = key_model_map
         self.key_transform_map = key_transform_map
+        self.low_dim_encoder_map = low_dim_encoder_map
         self.share_rgb_model = share_rgb_model
         self.rgb_keys = rgb_keys
         self.low_dim_keys = low_dim_keys
@@ -953,6 +1056,9 @@ class MultiImageObsEncoder(BaseEncoder):
             else:
                 if batch_size is None:
                     batch_size = data.shape[0]
+            data = data.reshape(data.shape[0], -1)
+            if key in self.low_dim_encoder_map:
+                data = self.low_dim_encoder_map[key](data)
             features.append(data)
 
         # concatenate all features

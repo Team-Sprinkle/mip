@@ -10,7 +10,16 @@ encoder_type: "mlp"    # "mlp", "per_step_mlp", "identity"
 emb_dim: -1
 
 # Image encoder configs (used when obs_type is "image").
-# Use "siglip2" or "siglip2:<hf-model-id>" for a frozen shared SigLIP2 backbone.
+# Use "siglip2" / "siglip2:<hf-model-id>" or
+# "dinov2" / "dinov2:<hf-model-id>" for a frozen shared HF vision backbone.
 rgb_model_name: "resnet18"
 use_seq: true
 keep_horizon_dims: true
+
+# Optional per-lowdim-key projection before concatenating with image features.
+# Keep at 0 for the original raw-state baseline.
+low_dim_encoder_dim: 0
+low_dim_encoder_hidden_dim: 128
+low_dim_encoder_layers: 2
+low_dim_encoder_activation: "gelu"
+low_dim_encoder_layer_norm: true

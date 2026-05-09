@@ -159,6 +159,11 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
             "crop_shape": task_config.crop_shape,
             "random_crop": task_config.random_crop,
             "use_group_norm": task_config.use_group_norm,
+            "low_dim_encoder_dim": network_config.low_dim_encoder_dim,
+            "low_dim_encoder_hidden_dim": network_config.low_dim_encoder_hidden_dim,
+            "low_dim_encoder_layers": network_config.low_dim_encoder_layers,
+            "low_dim_encoder_activation": network_config.low_dim_encoder_activation,
+            "low_dim_encoder_layer_norm": network_config.low_dim_encoder_layer_norm,
         }
         return MultiImageObsEncoder(**kwargs)
     else:
